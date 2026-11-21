@@ -1,0 +1,38 @@
+# Nothing in this repository is built, and nothing built belongs in it.
+*.o
+*.a
+*.app/
+*.dmg
+*.icns
+*.iconset/
+*.tiff
+*.pak
+bin/
+obj/
+stage/
+venv/
+__pycache__/
+
+# Assets never enter this repository -- see NOTICE.md. Listed so that an accidental
+# copy into the working tree cannot be committed by reflex.
+*.skel
+*.atlas
+*.ttf
+*.otf
+*.ogg
+*.mp3
+*.wav
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.heic
+*.mp4
+*.mov
+*.gif
+assets/
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/

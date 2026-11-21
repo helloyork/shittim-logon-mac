@@ -5,7 +5,7 @@
 #   app      bin/Shittim Logon.app -- the settings app as the program, the overlay
 #            inside it as a login item (Contents/Library/LoginItems), the assets, the
 #            icon and the text files. Needs lockscreen and settings built first.
-#   dmg      bin/ShittimLogon-<version>-mac.dmg: the app and an Applications link in a
+#   dmg      bin/ShittimLogon-Mac-<version>.dmg: the app and an Applications link in a
 #            window that says what to do (res/make-dmg-background.py, res/dmg-settings.py).
 #   SIGN_ID="Developer ID Application: ..." signs with that identity (hardened
 #   runtime, timestamp); without it everything is signed ad hoc.
@@ -71,7 +71,7 @@ for t in "${@:-list_animations}"; do
             # An app bundle, so `open` can start it in the GUI session from SSH.
             APP="$OUT/ShittimLock.app"
             mkdir -p "$APP/Contents/MacOS"
-            $CXX $OBJC $INC "$STAGE/macos/src/lockscreen.mm" -x none "$LIB" $MFW -framework IOKit -o "$APP/Contents/MacOS/lockscreen"
+            $CXX $OBJC $INC "$STAGE/macos/src/lockscreen.mm" -x none "$LIB" $MFW -framework IOKit -framework Carbon -o "$APP/Contents/MacOS/lockscreen"
             cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -179,7 +179,7 @@ EOF
             codesign --verify --deep --strict "$APP" ;;
         dmg)
             APP="$OUT/Shittim Logon.app"
-            DMG="$OUT/ShittimLogon-$VERSION-mac.dmg"
+            DMG="$OUT/ShittimLogon-Mac-$VERSION.dmg"
             # The window: the background res/make-dmg-background.py draws (sync.sh ships
             # it, 1x and 2x, joined here into one TIFF), the icons where it expects them.
             # dmgbuild writes the window's .DS_Store itself -- no Finder, no AppleScript.

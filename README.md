@@ -1,7 +1,8 @@
 # shittim-logon for macOS
 
 The macOS port of [shittim-logon](https://github.com/helloyork/shittim-logon): a
-live-rendered Spine scene on the macOS lock screen.
+live-rendered Spine scene on the macOS lock screen. This is the source of the release
+**ShittimLogon-Mac-1.0.0** (`macos/VERSION`).
 
 **This repository is the Mac port's own code. It is not the product and it will not
 build on its own.** The Mac build compiles the Windows sources it was ported from, and
@@ -18,6 +19,9 @@ runtime.
   （[helloyork/shittim-logon](https://github.com/helloyork/shittim-logon)），
   所以这个仓库**单独编译不起来**。
 - 仓库里**没有任何游戏资产**，也没有 Spine 运行时。
+
+**如果你装了发行版，而锁定屏幕出了问题：在锁定屏幕上按住 `Control + Option`，再按 `F11`
+（按住这两个键时按任意键都可以）。**覆盖层会立即退出，并保持停用，直到在设置程序里重新打开。
 
 ---
 
@@ -41,6 +45,26 @@ borderless window, and steps aside so that the password field is always the syst
   as a helper that `SMAppService` registers. launchd starts it in every session at login
   and restarts it if it fails. Nothing needs administrator rights: the overlay runs as
   the signed-in person.
+
+## Getting it off the screen
+
+A lock screen that something else draws over must always be able to come back to the
+system. Three things make sure it does (`macos/src/lockscreen.mm`):
+
+- **Control+Option+F11** is the Windows build's Ctrl+Alt+F11: the overlay leaves the
+  screen at once, writes a `disabled` marker into its settings directory and exits; it
+  stays off until the switch is turned on again in the settings app, which deletes the
+  marker. On the desktop it is an ordinary Carbon hot key. **On the lock screen the hot
+  key is never delivered** -- loginwindow has the keyboard -- and without Input
+  Monitoring permission no key except the modifiers can be read, only *that* a key went
+  down. So on the lock screen the chord is **Control+Option held and any key pressed**
+  (media keys included). F11 is the key people are told; typing a password never holds
+  both modifiers.
+- The unlock is also read off the session every half second, so a lost unlock
+  notification cannot leave the room over the desktop.
+- A watchdog thread ends the process if the main thread has been silent for 8 s with the
+  window on screen, so a hang cannot leave a frozen frame taking the clicks; launchd
+  starts a new one.
 
 ## How it is built
 
@@ -84,7 +108,7 @@ row).
 
 ```
 sh ~/shittim-mac/src/macos/build.sh lockscreen      # also: settings, still, voicetest, clocktest, list_animations
-sh ~/shittim-mac/src/macos/build.sh dist            # lockscreen, settings, the app, the disk image
+sh ~/shittim-mac/src/macos/build.sh dist            # lockscreen, settings, the app, bin/ShittimLogon-Mac-<version>.dmg
 ```
 
 `macos/sync.sh` ships a full source tree and, optionally, a directory of assets to the

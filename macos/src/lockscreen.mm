@@ -29,6 +29,14 @@
 //               starts it
 //     scene: pins one scene (a test); omitted or `auto`, the rotation above
 // The log is ~/Library/Logs/ShittimLogon/lockscreen.log, rolling at 1.5 MiB (host.h).
+//
+// Nothing of ours may stay over the screen when it should not (before release, 11-20):
+//   - the unlock is also read from the session every half second, so a lost
+//     com.apple.screenIsUnlocked cannot leave the room over the desktop (-heartbeat);
+//   - a main thread silent for kStall seconds while the window is up ends the process,
+//     and with it the window (watchdog below) -- launchd's KeepAlive starts a new one;
+//   - Control+Option+F11 is rescue.h's Ctrl+Alt+F11: off the screen at once, and off
+//     until it is enabled again (-rescue, RescuePath).
 
 #include "host.h"
 #include "bgm_mac.h"
@@ -38,12 +46,18 @@
 #include "wallpaper_mac.h"
 
 #import <AppKit/AppKit.h>
+#import <Carbon/Carbon.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 
+#include <atomic>
+#include <thread>
+
 #include <dlfcn.h>
+#include <time.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
 
@@ -85,6 +99,50 @@ static bool SessionLocked() {
     return [d[@"CGSSessionScreenIsLocked"] boolValue];
 }
 
+// ------------------------------------------------------------------ watchdog
+//
+// The dead man's switch of the Windows overlay's R97, in its plainest form: the main
+// thread stamps `beat` every half second (-heartbeat); a thread that does nothing else
+// looks once a second, and while the window is on screen a stamp older than kStall
+// ends the process -- no cleanup, nothing of the state machine touched. A hung main
+// thread would otherwise leave a frozen frame over the lock screen, and after the
+// unlock over the desktop too, taking the clicks; KeepAlive restarts only an exit.
+// The clock is CLOCK_UPTIME_RAW, which stands still while the Mac sleeps, so a lid
+// closed for an hour is not an hour of silence. Disarmed while the display sleeps
+// (nothing is on screen then, and timers may be slowed).
+// kStall: a normal lock's longest main-thread task is the scene load, under a second
+// (loadScene logs it); eight seconds is far beyond that and still short for somebody
+// looking at a frozen screen. Each lock logs its longest gap, to set this from data.
+namespace watchdog {
+constexpr double kStall = 8.0;
+static std::atomic<uint64_t> beat{0};
+static std::atomic<bool> armed{false};
+inline uint64_t Now() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+inline void Arm(bool on) { beat = Now(); armed = on; }
+inline void Start() {
+    beat = Now();
+    std::thread([] {
+        for (;;) {
+            sleep(1);
+            if (!armed.load()) continue;
+            const double gap = double(Now() - beat.load()) / 1e9;
+            if (gap < kStall) continue;
+            host::Log(L"watchdog: the main thread has been silent for %.1f s with the window on screen -- "
+                      L"ending the process so the screen is the system's again", gap);
+            _exit(3);
+        }
+    }).detach();
+}
+}
+
+// rescue.h's marker: %ProgramData%\ShittimLogon\disabled there, the settings directory
+// here (the overlay runs as the person). While it exists the overlay leaves at start
+// with 0, so KeepAlive does not bring it back; the settings app shows the switch off
+// and deletes it when the switch is turned on again (Distribution.swift).
+static NSString *RescuePath() { return [macconfig::Dir() stringByAppendingPathComponent:@"disabled"]; }
+
+static OSStatus OnRescueKey(EventHandlerCallRef, EventRef, void *ctx);
+
 // ------------------------------------------------------------------ views
 
 @interface MetalView : NSView
@@ -115,6 +173,7 @@ static float g_scale = 1.0f;
 static double g_ttl = 0;
 
 @interface App : NSObject <NSApplicationDelegate>
+- (void)rescue;       // OnRescueKey, a Carbon callback outside the implementation
 @end
 
 @implementation App {
@@ -131,6 +190,7 @@ static double g_ttl = 0;
     bool shown;
     // input
     double lastKey;
+    double lastSysKey;        // the same for NX_SYSDEFINED (media keys)
     NSUInteger lastFlags;
     bool lastButton;
     int frames;
@@ -162,6 +222,12 @@ static double g_ttl = 0;
     NSRect screenFrame;
     int geomFrames;
     std::string geomLast;
+    // the heartbeat: the watchdog's stamp, and the unlock read off the session
+    dispatch_source_t heart;
+    uint64_t heartLast, heartMaxGap;
+    bool inLock;              // between -locked and -unlocked
+    bool seenLocked;          // the session has said "locked" during this lock
+    int unlockedReads;        // ... and "unlocked" this many beats running since
 }
 
 // overlay.cpp's VoiceAnchor: the room's speaker while the room is up, else the
@@ -236,6 +302,15 @@ static bool VoiceAnchor(void *ctx, voice::Who who, int *x, int *y, subtitle::Box
     [window orderFrontRegardless];
     sky::Attach(window);
     [window orderOut:nil];
+
+    heartLast = watchdog::Now();
+    heart = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(heart, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC / 2, NSEC_PER_SEC / 20);
+    __weak App *weakSelf = self;
+    dispatch_source_set_event_handler(heart, ^{ [weakSelf heartbeat]; });
+    dispatch_resume(heart);
+    watchdog::Start();
+    [self armRescue];
 
     NSDistributedNotificationCenter *dnc = NSDistributedNotificationCenter.defaultCenter;
     [dnc addObserver:self selector:@selector(locked) name:@"com.apple.screenIsLocked" object:nil];
@@ -387,6 +462,9 @@ static bool VoiceAnchor(void *ctx, voice::Who who, int *x, int *y, subtitle::Box
 
 - (void)locked {
     host::Log(L"LOCKED");
+    inLock = true;
+    seenLocked = SessionLocked();
+    unlockedReads = 0;
     gapGen++;
     [seasonTimer invalidate]; seasonTimer = nil;
     cfg = macconfig::Load(host::Log);       // re-read per lock: a change applies on the next one
@@ -469,8 +547,11 @@ static bool VoiceAnchor(void *ctx, voice::Who who, int *x, int *y, subtitle::Box
     geomLast.clear();
     [self checkGeometry:"show"];
     shown = true;
+    heartMaxGap = 0;
+    watchdog::Arm(true);
     last = CACurrentMediaTime();
     lastKey = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventKeyDown);
+    lastSysKey = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, (CGEventType)14);
     lastFlags = NSEvent.modifierFlags;
     lastButton = false;
     frames = 0; fpsT = last;
@@ -479,7 +560,11 @@ static bool VoiceAnchor(void *ctx, voice::Who who, int *x, int *y, subtitle::Box
 }
 
 - (void)unlocked {
-    host::Log(L"UNLOCKED");
+    // Once per lock: the heartbeat may have seen the unlock first.
+    if (!inLock) return;
+    inLock = false;
+    host::Log(L"UNLOCKED (longest main-thread gap while shown: %.0f ms)", heartMaxGap / 1e6);
+    watchdog::Arm(false);
     [self holdDisplay:false];
     wall.Out(host::Log);
     voice.End();
@@ -504,6 +589,7 @@ static bool VoiceAnchor(void *ctx, voice::Who who, int *x, int *y, subtitle::Box
     if (!shown || asleep) return;
     host::Log(L"display asleep -- quiet");
     asleep = true;
+    watchdog::Arm(false);
     voice.FadeOut();
     bgm.Leave(macbgm::kFadePause, false);
     [timer invalidate]; timer = nil;
@@ -513,8 +599,59 @@ static bool VoiceAnchor(void *ctx, voice::Who who, int *x, int *y, subtitle::Box
     if (!shown || !asleep) return;
     host::Log(L"display awake");
     asleep = false;
+    heartLast = watchdog::Now();
+    watchdog::Arm(true);
     last = CACurrentMediaTime();
     [self startTimer];
+}
+
+// Every half second on the main thread: the watchdog's stamp, and the unlock read off
+// the session in case its notification never came. The session must have said
+// "locked" during this lock first -- were CGSSessionScreenIsLocked ever missing, this
+// would otherwise take the room away a second into every lock -- and then "unlocked"
+// on two beats running.
+- (void)heartbeat {
+    const uint64_t now = watchdog::Now();
+    if (shown && !asleep && now - heartLast > heartMaxGap) heartMaxGap = now - heartLast;
+    heartLast = now;
+    watchdog::beat = now;
+    if (!inLock || !shown) return;
+    if (SessionLocked()) { seenLocked = true; unlockedReads = 0; return; }
+    if (!seenLocked || ++unlockedReads < 2) return;
+    host::Log(L"the session is unlocked but no unlock notification came -- leaving as if it had");
+    [self unlocked];
+}
+
+// rescue.h's RegisterHotKey, in Carbon: one chord, delivered as one event, which is
+// not a hook and sees no other key -- the reason Windows chose it holds here. Control
+// rather than Command, as Ctrl there. On a keyboard whose top row is media keys F11
+// needs Fn as well (Windows' laptops have the same note).
+- (void)armRescue {
+    EventTypeSpec spec = { kEventClassKeyboard, kEventHotKeyPressed };
+    InstallApplicationEventHandler(&OnRescueKey, 1, &spec, (__bridge void *)self, nullptr);
+    EventHotKeyID hid = { 'shtm', 1 };
+    EventHotKeyRef ref = nullptr;
+    const OSStatus st = RegisterEventHotKey(kVK_F11, controlKey | optionKey, hid, GetApplicationEventTarget(), 0, &ref);
+    if (st == noErr) host::Log(L"rescue: Control+Option+F11 armed");
+    else host::Log(L"rescue: Control+Option+F11 NOT armed (OSStatus %d)", (int)st);
+}
+
+// overlay.cpp's WM_HOTKEY: the screen first, then the marker, then the quit -- the
+// person pressing this wants the screen gone, and if the marker cannot be written
+// they still get this lock back.
+- (void)rescue {
+    host::Log(L"rescue: Control+Option+F11 -- taking the overlay off the screen");
+    watchdog::Arm(false);
+    window.alphaValue = 0;
+    [window orderOut:nil];
+    NSString *path = RescuePath();
+    [NSFileManager.defaultManager createDirectoryAtPath:macconfig::Dir() withIntermediateDirectories:YES attributes:nil error:nil];
+    if ([@"Control+Option+F11\n" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil])
+        host::Log(L"rescue: wrote %hs -- off until it is enabled again in the settings app", path.UTF8String);
+    else
+        host::Log(L"rescue: COULD NOT write %hs -- this screen is clear, but the overlay returns when launchd restarts it",
+                  path.UTF8String);
+    [NSApp terminate:nil];        // exit 0: KeepAlive leaves it be
 }
 
 - (void)applicationWillTerminate:(NSNotification *)n { [self holdDisplay:false]; wall.Out(host::Log); bgm.End(0.0f); }
@@ -629,9 +766,29 @@ static bool VoiceAnchor(void *ctx, voice::Who who, int *x, int *y, subtitle::Box
 
     // Wake: any key (including a bare modifier) or a click while the room is up.
     const double k = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGEventKeyDown);
+    // NX_SYSDEFINED: the media keys -- F11 on a laptop's top row without Fn.
+    const double sk = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, (CGEventType)14);
     const NSUInteger flags = NSEvent.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    const bool pressed = k + 0.005 < lastKey || sk + 0.005 < lastSysKey;
     const bool key = k + 0.005 < lastKey || flags != lastFlags;
-    lastKey = k; lastFlags = flags;
+    lastKey = k; lastSysKey = sk; lastFlags = flags;
+
+    // Control+Option+F11 on the lock screen. The Carbon hot key (-armRescue) is armed but
+    // never delivered there: loginwindow has the keyboard (measured 2026-11-20:
+    // "armed" in the log, the chord pressed on the lock screen, nothing came).
+    // Nor can F11 itself be read: without Input Monitoring the keyboard state answers
+    // "up" for every key but the modifiers (same day: Control+Option seen down, F11 read
+    // up while it was pressed), and that permission is not one to ask of people for a
+    // lock screen. What can be read is the modifiers and *that* a key went down. So
+    // here the chord is Control+Option held and a key pressed with them -- F11 is the
+    // key people are told, any key does it; typing a password never holds both.
+    const NSEventModifierFlags chord = NSEventModifierFlagControl | NSEventModifierFlagOption;
+    if ((flags & chord) == chord && pressed) {
+        host::Log(L"rescue: a key with Control+Option on the lock screen (input monitoring %hs)",
+                  CGPreflightListenEventAccess() ? "granted" : "not granted");
+        [self rescue];
+        return;
+    }
     if (layer->phase == fx::Phase::Idle && (key || (button && !lastButton))) {
         host::Log(L"wake: %hs", key ? "key" : "click");
         layer->Trigger();
@@ -743,6 +900,11 @@ static std::string BundledAssets() {
     return "";
 }
 
+static OSStatus OnRescueKey(EventHandlerCallRef, EventRef, void *ctx) {
+    [(__bridge App *)ctx rescue];
+    return noErr;
+}
+
 // One overlay per session, as instance.h is on Windows: the login item and somebody
 // opening the helper by hand would otherwise put two windows over the lock screen.
 // The lock is the kernel's, so a crash releases it.
@@ -775,6 +937,11 @@ int main(int argc, char **argv) {
             return 2;
         }
         // Exit 0: the login item's KeepAlive restarts only a failure, and this is not one.
+        if ([NSFileManager.defaultManager fileExistsAtPath:RescuePath()]) {
+            host::Log(L"rescue: %hs exists (Control+Option+F11) -- staying off until it is enabled again",
+                      RescuePath().UTF8String);
+            return 0;
+        }
         if (!OnlyInstance()) { host::Log(L"another overlay is running in this session -- leaving"); return 0; }
         // Turning it off (the settings app unregisters the login item) is a SIGTERM from
         // launchd: put the desktop picture back and stop the music the way quitting does.

@@ -83,6 +83,7 @@ struct SystemPage: View {
                     Label2(title: T("启用 Shittim Logon"),
                            detail: state == .on ? T("关闭后锁定屏幕恢复系统默认，设置与文件保留")
                                  : state == .needsApproval ? T("需要在「系统设置」的「登录项」中允许 Shittim Logon")
+                                 : Overlay.rescued ? T("已在锁定屏幕按 Control + Option + F11 停用；打开此开关即可重新启用")
                                  : T("当前已停用，锁定屏幕为系统默认"))
                 }
                 .toggleStyle(.switch)

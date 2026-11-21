@@ -30,11 +30,22 @@ enum Overlay {
         let plistURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchAgents/" + plist)
         if !FileManager.default.fileExists(atPath: plistURL.path) { return .notBundled }
         switch service.status {
-        case .enabled: return .on
+        case .enabled: return rescued ? .off : .on
         case .requiresApproval: return .needsApproval
         default: return .off
         }
     }
+
+    /// lockscreen.mm's RescuePath: Control+Option+F11 on the lock screen took the overlay
+    /// away and keeps it away (rescue.h's `disabled` on Windows). The login item is still
+    /// registered, but the overlay leaves at every start, so the switch shows off; turning
+    /// it on deletes the marker.
+    static var settingsDir: String {
+        if let e = ProcessInfo.processInfo.environment["SHITTIM_SETTINGS_DIR"], !e.isEmpty { return e }
+        return NSHomeDirectory() + "/Library/Application Support/ShittimLogon"
+    }
+    static var rescueMarker: String { settingsDir + "/disabled" }
+    static var rescued: Bool { FileManager.default.fileExists(atPath: rescueMarker) }
 
     static var running: Bool {
         !NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).isEmpty
@@ -72,6 +83,7 @@ enum Overlay {
     /// wait and do it again -- after 10 s, then after 15 s.
     static func enable() -> (ok: Bool, text: String) {
         if let p = placementProblem { return (false, p) }
+        try? FileManager.default.removeItem(atPath: rescueMarker)
         releaseHelper()
         let pauses: [Double] = [0, 10, 15]   // before each attempt after the first
         for (attempt, pause) in pauses.enumerated() {
@@ -181,7 +193,7 @@ enum Overlay {
         let fm = FileManager.default
         try? fm.removeItem(atPath: NSHomeDirectory() + "/Library/Logs/ShittimLogon")
         let dir = (store.s.filePath as NSString).deletingLastPathComponent
-        let state = ["next-scene", "shown-scene", "shown-track", "lockscreen.lock", "wallpaper-backup.txt",
+        let state = ["next-scene", "shown-scene", "shown-track", "lockscreen.lock", "wallpaper-backup.txt", "disabled",
                      "clock-font-custom.ttf", "subtitle-font-custom.ttf",
                      "voice-custom", "voice-custom.partial", "voice-custom.old"]
         for name in state { try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(name)) }

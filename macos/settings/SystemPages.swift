@@ -149,10 +149,12 @@ struct AboutPage: View {
             Section {
                 Label2(title: "Shittim Logon", detail: "macOS · " + Overlay.version)   // i18n: no
             }
-            // Windows' line before this one says the software is open source; the Mac
-            // app says only the rights line here.
+            // configwindow.h BuildAbout: setup.h kFreeLine and kRightsLine as one line. The Mac
+            // port's source is public too (2026-11-20, github.com/helloyork/shittim-logon-mac).
             Section(T("版权")) {
-                Note(text: T("著作权由作者保留；本软件可自由使用。"))
+                // tr(L"%s%s") is the join: nothing in Chinese and Japanese, a space in English.
+                let join = T("%s%s").replacingOccurrences(of: "%s", with: "")
+                Note(text: T("本软件开源且完全免费，从未以任何形式出售。") + join + T("著作权由作者保留；本软件可自由使用。"))
             }
             // The files that ship beside the program (setup.h kDocFiles), in the app's Resources.
             if let res = Bundle.main.resourceURL, FileManager.default.fileExists(atPath: res.appendingPathComponent("LICENSE.txt").path) {
